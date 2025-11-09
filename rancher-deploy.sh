@@ -1,7 +1,8 @@
 #!/bin/bash
 # ==========================================================
-# Full HA Rancher Deployment (3-node control plane + HAProxy + Keepalived + Longhorn)
-# Compatible with: RHEL 9, Rancher v2.12.3, RKE2 v1.31.4+rke2r1, Longhorn v1.9.2
+# Full HA Rancher Deployment
+# (3-node control plane each running RKE2 + HAProxy + Keepalived)
+# With 3 worker/storage nodes (Longhorn integrated)
 # ==========================================================
 set -euo pipefail
 
@@ -21,7 +22,6 @@ RANCHER_VERSION="v2.12.3"
 RKE2_VERSION="v1.31.4+rke2r1"
 LONGHORN_VERSION="v1.9.2"
 CLUSTER_NAME="rancher-production"
-
 CLUSTER_DIR="/opt/rke2-ha"
 mkdir -p "${CLUSTER_DIR}"
 
@@ -44,7 +44,10 @@ prep_node() {
   log "Preparing node: $node"
   remote_exec $node "
     sudo dnf -y update &&
-    sudo dnf install -y ${PACKAGES} &&
+    sudo dnf install -y epel-release || true &&
+    sudo dnf install -y ${PACKAGES} --allowerasing &&
+    command -v haproxy >/dev/null 2>&1 || { echo 'haproxy missing'; exit 1; } &&
+    command -v keepalived >/dev/null 2>&1 || { echo 'keepalived missing'; exit 1; } &&
     sudo systemctl disable --now firewalld || true &&
     sudo setenforce 0 || true &&
     sudo sed -i 's/^SELINUX=.*/SELINUX=permissive/' /etc/selinux/config &&
@@ -64,7 +67,6 @@ setup_haproxy_keepalived() {
   local node=$1 priority=$2
   log "Setting up HAProxy + Keepalived on $node"
 
-  # Each HAProxy listens on alternate ports 6444/9346 to avoid conflict with RKE2
   local backend_cfg=""
   for host in "${MGMT_NODES[@]}"; do
     backend_cfg+="    server ${host} ${host}:6443 check\n"
@@ -101,26 +103,13 @@ backend rke2_servers
 $(echo -e "${backend_cfg//6443/9345}")
 EOF'"
 
-  remote_exec $node "sudo systemctl enable haproxy --now"
-
-  # Keepalived config for VIP floating on eth0
-  remote_exec $node "sudo bash -c 'cat > /etc/keepalived/keepalived.conf <<EOF
-vrrp_instance VI_1 {
-  state BACKUP
-  interface ${VIP_INTERFACE}
-  virtual_router_id 51
-  priority ${priority}
-  advert_int 1
-  authentication {
-    auth_type PASS
-    auth_pass 42secret
-  }
-  virtual_ipaddress {
-    ${VIP}/24
-  }
-}
-EOF'"
-  remote_exec $node "sudo systemctl enable --now keepalived"
+  remote_exec $node "
+    sudo systemctl daemon-reload &&
+    sudo systemctl enable haproxy keepalived --now &&
+    sudo systemctl restart haproxy keepalived &&
+    sudo systemctl status haproxy --no-pager &&
+    sudo systemctl status keepalived --no-pager
+  "
 }
 
 # ==============================
